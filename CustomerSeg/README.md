@@ -1,6 +1,6 @@
-# AQI Prediction Project
+# Customer Segmentation & Value Prediction using RFM 
 
-This project aims to predict the Air Quality Index (AQI) using machine learning.
+This project aims to predict the Customer Segmentation & Value Prediction  using machine learning.
 
 ## Structure
 
