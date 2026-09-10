@@ -15,8 +15,8 @@ class MarketBasketAnalysis:
                   .sum().unstack().reset_index().fillna(0)
                   .set_index('Invoice'))
         
-        # Convert to boolean (1/0)
-        basket_sets = basket.map(lambda x: 1 if x >= 1 else 0)
+        # Convert to boolean (True/False)
+        basket_sets = (basket > 0)
         return basket_sets
 
     def run_apriori(self, basket_sets, min_support=0.05, min_confidence=0.1):

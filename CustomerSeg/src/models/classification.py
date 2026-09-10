@@ -41,7 +41,7 @@ class CustomerClassifier:
                 "Precision": precision_score(y_test, y_pred, zero_division=0),
                 "Recall": recall_score(y_test, y_pred, zero_division=0),
                 "F1": f1_score(y_test, y_pred, zero_division=0),
-                "ConfusionMatrix": confusion_matrix(y_test, y_pred).tolist(),
+                "ConfusionMatrix": confusion_matrix(y_test, y_pred, labels=[0, 1]).tolist(),
             }
             
             if y_prob is not None:

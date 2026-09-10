@@ -6,3 +6,4 @@ scikit-learn
 streamlit
 mlxtend
 openpyxl
+plotly
