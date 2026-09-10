@@ -116,9 +116,7 @@ class DataPreprocessor:
         self.df['TotalAmount'] = self.df['Quantity'] * self.df['Price']
 
         # Date Parsing — use errors='coerce' so unparseable strings become NaT
-        self.df['InvoiceDate'] = pd.to_datetime(
-            self.df['InvoiceDate'], errors='coerce', infer_datetime_format=True
-        )
+        self.df['InvoiceDate'] = pd.to_datetime(self.df['InvoiceDate'], errors='coerce')
         # Drop rows where InvoiceDate could not be parsed
         n_bad_dates = int(self.df['InvoiceDate'].isna().sum())
         if n_bad_dates > 0:
