@@ -84,8 +84,16 @@ class DataPreprocessor:
         # 5. Remove Invalid Values (Negative/Zero Quantity or Price)
         # Note: Some returns might have negative quantity, but we removed 'C' invoices.
         # Check for any remaining anomalies.
-        invalid_mask = (self.df['Quantity'] <= 0) | (self.df['Price'] <= 0)
-        n_invalid = invalid_mask.sum()
+        # Coerce to numeric first to handle non-numeric / missing values gracefully
+        if 'Quantity' in self.df.columns:
+            self.df['Quantity'] = pd.to_numeric(self.df['Quantity'], errors='coerce')
+        if 'Price' in self.df.columns:
+            self.df['Price'] = pd.to_numeric(self.df['Price'], errors='coerce')
+
+        q_col = self.df.get('Quantity', pd.Series(dtype=float))
+        p_col = self.df.get('Price', pd.Series(dtype=float))
+        invalid_mask = (q_col <= 0) | (p_col <= 0) | q_col.isna() | p_col.isna()
+        n_invalid = int(invalid_mask.sum())
         self.df = self.df[~invalid_mask]
         logger.info(f"Removed {n_invalid} rows with invalid Quantity/Price.")
         
@@ -106,9 +114,17 @@ class DataPreprocessor:
         
         # Revenue Calculation
         self.df['TotalAmount'] = self.df['Quantity'] * self.df['Price']
-        
-        # Date Parsing
-        self.df['InvoiceDate'] = pd.to_datetime(self.df['InvoiceDate'])
+
+        # Date Parsing — use errors='coerce' so unparseable strings become NaT
+        self.df['InvoiceDate'] = pd.to_datetime(
+            self.df['InvoiceDate'], errors='coerce', infer_datetime_format=True
+        )
+        # Drop rows where InvoiceDate could not be parsed
+        n_bad_dates = int(self.df['InvoiceDate'].isna().sum())
+        if n_bad_dates > 0:
+            logger.warning(f"Dropped {n_bad_dates} rows with unparseable InvoiceDate values.")
+            self.df = self.df.dropna(subset=['InvoiceDate'])
+
         self.df['Year'] = self.df['InvoiceDate'].dt.year
         self.df['Month'] = self.df['InvoiceDate'].dt.month
         self.df['Hour'] = self.df['InvoiceDate'].dt.hour
@@ -173,6 +189,14 @@ class DataPreprocessor:
         # We drop Scaled columns for the CSV usually to save space unless needed specifically
         save_cols = [c for c in self.df.columns if not c.endswith('_Scaled')]
         self.df[save_cols].to_csv(f"{output_dir}/cleaned_transactions.csv", index=False)
+        
+        # Save a stratified random sample (up to 25,000 rows) for fast EDA & association rules.
+        # This keeps transactions_sample.csv always in sync with the full cleaned data.
+        sample_size = min(25_000, len(self.df))
+        self.df[save_cols].sample(n=sample_size, random_state=42).to_csv(
+            f"{output_dir}/transactions_sample.csv", index=False
+        )
+        logger.info(f"Saved transactions sample: {sample_size:,} rows -> {output_dir}/transactions_sample.csv")
         
         # Save Customer Level Data (RFM)
         rfm = self.get_customer_data()

@@ -155,6 +155,45 @@ def load_transactions_sample():
         df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'], errors='coerce')
     return df
 
+# ── Cached heavy computation helpers ───────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def _cached_mine_rules(country_filter, min_support, min_conf):
+    """Run Apriori once per unique (filter, support, conf) combination."""
+    df = load_transactions_sample()
+    if df is None:
+        return None
+    mba_df = df.copy()
+    if country_filter != "All Sample":
+        mba_df = mba_df[mba_df['Country'] == country_filter]
+    top_items = mba_df['Description'].value_counts().head(200).index
+    filtered_df = mba_df[mba_df['Description'].isin(top_items)].head(5000)
+    mba = MarketBasketAnalysis()
+    basket = mba.prepare_basket(filtered_df)
+    rules = mba.run_apriori(basket, min_support=min_support, min_confidence=min_conf)
+    return rules
+
+@st.cache_data(show_spinner=False)
+def _cached_clf_benchmark(_rfm_df):
+    """Train all 4 classifiers once and cache results."""
+    clf = CustomerClassifier()
+    Xc_tr, Xc_te, yc_tr, yc_te = clf.prepare_data(_rfm_df)
+    results = clf.train_evaluate_all(Xc_tr, Xc_te, yc_tr, yc_te)
+    return results
+
+@st.cache_data(show_spinner=False)
+def _cached_nb_model(_rfm_df):
+    """Train only NaiveBayes (used by Simulator) and cache."""
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.model_selection import train_test_split
+    rfm_copy = _rfm_df.copy()
+    rfm_copy['IsReturn'] = (rfm_copy['Frequency'] > 1).astype(int)
+    X = rfm_copy[['Recency', 'Monetary']]
+    y = rfm_copy['IsReturn']
+    X_tr, _, y_tr, _ = train_test_split(X, y, test_size=0.2, random_state=42)
+    nb = GaussianNB()
+    nb.fit(X_tr, y_tr)
+    return nb
+
 # Load core datasets
 rfm = load_rfm_mart()
 transactions_df = load_transactions_sample()
@@ -187,7 +226,32 @@ with st.sidebar:
     <span class="badge badge-purple">🛡️ Medallion Architecture</span>
     """, unsafe_allow_html=True)
     
+    # ── Data Source Indicator ──────────────────────────────────────────────────
     st.markdown("---")
+    if st.session_state.get("_using_pipeline_data"):
+        st.markdown("""
+        <div style="background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.4);
+                    border-radius:8px; padding:10px 12px; margin-bottom:8px;">
+            <div style="font-size:0.72rem; color:#6ee7b7; font-weight:700; letter-spacing:0.8px;">📡 DATA SOURCE</div>
+            <div style="font-size:0.85rem; color:#f8fafc; margin-top:4px;">🟢 Live Pipeline Output</div>
+            <div style="font-size:0.72rem; color:#94a3b8; margin-top:2px;">Freshly processed via your upload</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("↩️ Revert to Default Data", use_container_width=True, key="revert_data_btn"):
+            st.session_state.pop("_using_pipeline_data", None)
+            load_rfm_mart.clear()
+            load_transactions_sample.clear()
+            st.rerun()
+    else:
+        st.markdown("""
+        <div style="background:rgba(99,102,241,0.12); border:1px solid rgba(99,102,241,0.3);
+                    border-radius:8px; padding:10px 12px; margin-bottom:8px;">
+            <div style="font-size:0.72rem; color:#a5b4fc; font-weight:700; letter-spacing:0.8px;">📡 DATA SOURCE</div>
+            <div style="font-size:0.85rem; color:#f8fafc; margin-top:4px;">🔵 Default Pre-Processed</div>
+            <div style="font-size:0.72rem; color:#94a3b8; margin-top:2px;">Run pipeline tab to use your own data</div>
+        </div>
+        """, unsafe_allow_html=True)
+
     st.markdown("#### 📁 Mart Summary")
     st.caption(f"**Customer Base:** {len(rfm):,} Unique Accounts")
     if transactions_df is not None:
@@ -481,23 +545,19 @@ elif nav_option == "🔮 Live Predictive AI Simulator":
         st.caption("• **CLV Engine:** Trained Polynomial / Linear Regressor on RFM feature mart.")
         st.caption("• **Churn Predictor:** Gaussian Naive Bayes / Random Forest with calibrated probabilities.")
         
-    # Model Training on the fly (Fast cached)
+    # Model Training — cached so slider changes don't retrain
     reg_model = SalesRegressor()
     X_train_r, X_test_r, y_train_r, y_test_r = reg_model.prepare_data(rfm)
     reg_model.train_linear(X_train_r, y_train_r)
-    
-    clf_model = CustomerClassifier()
-    X_train_c, X_test_c, y_train_c, y_test_c = clf_model.prepare_data(rfm)
-    clf_model.train_evaluate_all(X_train_c, X_test_c, y_train_c, y_test_c)
-    
+
     # Predict CLV
     input_df_reg = pd.DataFrame({'Recency': [input_recency], 'Frequency': [input_frequency]})
     pred_clv = float(reg_model.predict(input_df_reg, model_type='linear')[0])
-    pred_clv = max(pred_clv, input_monetary) # CLV lower-bound is current spend
-    
-    # Predict Churn
+    pred_clv = max(pred_clv, input_monetary)  # CLV lower-bound is current spend
+
+    # Predict Churn — NaiveBayes only (fast, cached)
+    trained_clf = _cached_nb_model(rfm)
     input_df_clf = pd.DataFrame({'Recency': [input_recency], 'Monetary': [input_monetary]})
-    trained_clf = clf_model.models['NaiveBayes']
     return_prob = float(trained_clf.predict_proba(input_df_clf)[0][1])
     churn_prob = 1.0 - return_prob
     
@@ -566,7 +626,7 @@ elif nav_option == "🔮 Live Predictive AI Simulator":
 elif nav_option == "🛒 Market Basket Recommender":
     st.subheader("🛒 Market Basket Analysis & Cross-Selling Engine")
     st.markdown("Uncover purchase associations and product affinity rules using the **Apriori Algorithm** to power automated product bundles.")
-    
+
     if transactions_df is None:
         st.warning("Transaction data is not available for Market Basket Analysis.")
     else:
@@ -577,23 +637,30 @@ elif nav_option == "🛒 Market Basket Recommender":
             min_conf = st.slider("Minimum Confidence Threshold:", min_value=0.05, max_value=0.60, value=0.15, step=0.05)
         with c_p3:
             country_filter = st.selectbox("Market Geographic Filter:", ["United Kingdom", "All Sample"])
-            
-        with st.spinner("Mining Association Rules..."):
-            mba_df = transactions_df.copy()
-            if country_filter != "All Sample":
-                mba_df = mba_df[mba_df['Country'] == country_filter]
-                
-            # Filter top descriptions to keep runtime fast & relevant
-            top_items = mba_df['Description'].value_counts().head(200).index
-            filtered_df = mba_df[mba_df['Description'].isin(top_items)].head(5000)
-            
-            mba = MarketBasketAnalysis()
-            basket = mba.prepare_basket(filtered_df)
-            rules = mba.run_apriori(basket, min_support=min_support, min_confidence=min_conf)
-            
-        if rules.empty:
-            st.warning("No association rules found at this threshold. Try lowering the Minimum Support or Confidence slider.")
+
+        # ── Run gate: Apriori only runs when user clicks the button ──────────
+        mba_key = f"mba_rules_{country_filter}_{min_support}_{min_conf}"
+        run_mba = st.button("⛏️ Mine Association Rules", type="primary", key="run_mba_btn")
+
+        if run_mba:
+            st.session_state.pop("_mba_rules", None)   # invalidate cache on new run
+            st.session_state["_mba_key"] = mba_key
+
+        rules = None
+        if "_mba_rules" in st.session_state and st.session_state.get("_mba_key") == mba_key:
+            rules = st.session_state["_mba_rules"]
+        elif run_mba:
+            with st.spinner("⛏️ Mining Association Rules… (this may take ~20s)"):
+                rules = _cached_mine_rules(country_filter, min_support, min_conf)
+            st.session_state["_mba_rules"] = rules
+            st.session_state["_mba_key"] = mba_key
         else:
+            st.info("👆 Adjust thresholds above, then click **⛏️ Mine Association Rules** to run Apriori. "
+                    "Results are cached — re-mining only happens when you click again.")
+            
+        if rules is not None and rules.empty:
+            st.warning("No association rules found at this threshold. Try lowering the Minimum Support or Confidence slider.")
+        elif rules is not None:
             # Format rules
             rules_display = rules.copy()
             rules_display['antecedents'] = rules_display['antecedents'].apply(lambda x: ', '.join(list(x)))
@@ -691,42 +758,58 @@ elif nav_option == "🧠 Machine Learning Arena":
     # ------------------ CLASSIFICATION ------------------
     with sub_tab2:
         st.markdown("#### 🛡️ Classification Benchmark (Predicting Return Customer)")
-        clf = CustomerClassifier()
-        Xc_tr, Xc_te, yc_tr, yc_te = clf.prepare_data(rfm)
-        
-        with st.spinner("Training Classifiers (Naive Bayes, Decision Tree, SVM, KNN)..."):
-            clf_results = clf.train_evaluate_all(Xc_tr, Xc_te, yc_tr, yc_te)
-            
-        clf_metrics_df = pd.DataFrame(clf_results).T[['Accuracy', 'Precision', 'Recall', 'F1']]
-        
-        st.table(clf_metrics_df.style.format('{:.2%}'))
-        
-        # Interactive Bar Chart
-        fig_clf = px.bar(
-            clf_metrics_df.reset_index(),
-            x='index',
-            y=['Accuracy', 'F1', 'Precision'],
-            barmode='group',
-            title="Model Performance Comparison across Metrics",
-            labels={'index': 'Classifier', 'value': 'Score', 'variable': 'Metric'},
-            color_discrete_sequence=['#6366f1', '#10b981', '#f59e0b']
-        )
-        fig_clf.update_layout(template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
-        st.plotly_chart(fig_clf, use_container_width=True)
-        
-        # Confusion Matrix display
-        st.markdown("##### 🔲 Confusion Matrix (Decision Tree)")
-        cm = np.array(clf_results['DecisionTree']['ConfusionMatrix'])
-        fig_cm = px.imshow(
-            cm,
-            text_auto=True,
-            color_continuous_scale='Blues',
-            labels=dict(x="Predicted Class", y="Actual Class", color="Count"),
-            x=['One-Time (0)', 'Returning (1)'],
-            y=['One-Time (0)', 'Returning (1)']
-        )
-        fig_cm.update_layout(template="plotly_dark", height=320, width=450, margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig_cm, use_container_width=False)
+        st.caption("Trains Naive Bayes, Decision Tree, SVM (Linear), and KNN. SVM & KNN are capped at 3k/5k samples. "
+                   "Results are cached after the first run.")
+
+        run_clf = st.button("🚀 Run Classification Benchmark", type="primary", key="run_clf_btn")
+        if run_clf:
+            _cached_clf_benchmark.clear()  # force re-run if clicked again
+
+        clf_results = None
+        if run_clf or "_clf_results" in st.session_state:
+            if run_clf or "_clf_results" not in st.session_state:
+                with st.spinner("Training Naive Bayes, Decision Tree, SVM, KNN… (~15–30s)"):
+                    clf_results = _cached_clf_benchmark(rfm)
+                st.session_state["_clf_results"] = clf_results
+            else:
+                clf_results = st.session_state["_clf_results"]
+        else:
+            st.info("👆 Click **🚀 Run Classification Benchmark** to train all classifiers. "
+                    "Results are cached and won't re-train on page navigation.")
+
+        if clf_results is None:
+            pass  # waiting for user to click Run
+        else:
+            clf_metrics_df = pd.DataFrame(clf_results).T[['Accuracy', 'Precision', 'Recall', 'F1']]
+
+            st.table(clf_metrics_df.style.format('{:.2%}'))
+
+            # Interactive Bar Chart
+            fig_clf = px.bar(
+                clf_metrics_df.reset_index(),
+                x='index',
+                y=['Accuracy', 'F1', 'Precision'],
+                barmode='group',
+                title="Model Performance Comparison across Metrics",
+                labels={'index': 'Classifier', 'value': 'Score', 'variable': 'Metric'},
+                color_discrete_sequence=['#6366f1', '#10b981', '#f59e0b']
+            )
+            fig_clf.update_layout(template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig_clf, use_container_width=True)
+
+            # Confusion Matrix display
+            st.markdown("##### 🔲 Confusion Matrix (Decision Tree)")
+            cm = np.array(clf_results['DecisionTree']['ConfusionMatrix'])
+            fig_cm = px.imshow(
+                cm,
+                text_auto=True,
+                color_continuous_scale='Blues',
+                labels=dict(x="Predicted Class", y="Actual Class", color="Count"),
+                x=['One-Time (0)', 'Returning (1)'],
+                y=['One-Time (0)', 'Returning (1)']
+            )
+            fig_cm.update_layout(template="plotly_dark", height=320, width=450, margin=dict(l=20, r=20, t=20, b=20))
+            st.plotly_chart(fig_cm, use_container_width=False)
 
     # ------------------ PCA ------------------
     with sub_tab3:
@@ -762,49 +845,473 @@ elif nav_option == "🧠 Machine Learning Arena":
 # TAB 6: DATA ENGINEERING & PIPELINE TELEMETRY
 # ==============================================================================
 elif nav_option == "⚙️ Data Engineering & Pipeline":
-    st.subheader("⚙️ Enterprise Data Engineering & Pipeline Telemetry")
-    st.markdown("Visualizing the Medallion Architecture, automated data cleansing sanitization, and production audit logs.")
-    
-    # Medallion Architecture Diagram
-    st.markdown("#### 🏗️ Medallion Pipeline Architecture")
+    import io
+    import logging as _logging
+    import time
+    from src.data_prep import DataPreprocessor
+
     st.markdown("""
-    <div style="display:flex; justify-content:space-between; gap:15px; margin-bottom:20px; flex-wrap:wrap;">
-        <div style="flex:1; min-width:250px; background:#1e2235; border:1px solid rgba(245,158,11,0.3); border-radius:12px; padding:18px;">
-            <div style="font-size:0.8rem; color:#fcd34d; font-weight:700;">BRONZE LAYER (RAW)</div>
-            <h4 style="margin:6px 0; color:#fff;">online_retail_II.csv</h4>
-            <p style="font-size:0.85rem; color:#94a3b8; margin:0;">1,067,371 raw streaming transactions. Contains missing IDs, cancellations ('C'), and non-standard strings.</p>
-        </div>
-        <div style="flex:1; min-width:250px; background:#1e2235; border:1px solid rgba(59,130,246,0.3); border-radius:12px; padding:18px;">
-            <div style="font-size:0.8rem; color:#93c5fd; font-weight:700;">SILVER LAYER (CLEANSED)</div>
-            <h4 style="margin:6px 0; color:#fff;">cleaned_transactions</h4>
-            <p style="font-size:0.85rem; color:#94a3b8; margin:0;">779,425 validated rows (73.02% retention). Enriched with TimeOfDay, Revenue, and ISO-8859 encoding.</p>
-        </div>
-        <div style="flex:1; min-width:250px; background:#1e2235; border:1px solid rgba(16,185,129,0.3); border-radius:12px; padding:18px;">
-            <div style="font-size:0.8rem; color:#6ee7b7; font-weight:700;">GOLD LAYER (ANALYTICS MART)</div>
-            <h4 style="margin:6px 0; color:#fff;">rfm_customer_data.csv</h4>
-            <p style="font-size:0.85rem; color:#94a3b8; margin:0;">5,878 customer-level feature vectors (Recency, Frequency, Monetary). Ready for sub-second ML inference.</p>
-        </div>
+    <div class="header-box" style="margin-bottom:18px;">
+        <p class="header-title" style="font-size:1.5rem;">⚙️ Live Data Engineering & Pipeline Runner</p>
+        <p class="header-sub">Upload your raw retail CSV and execute the full Medallion pipeline in real-time. Every cleaning step, log line, and quality metric is computed live from your data.</p>
     </div>
     """, unsafe_allow_html=True)
-    
-    # Audit Metrics Grid
-    st.markdown("#### 🛡️ Data Quality & Cleansing Audit Metrics")
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Raw Ingested Records", "1,067,371", "100%")
-    a2.metric("Missing Customer IDs Dropped", "243,007", "-22.7%")
-    a3.metric("Duplicate Rows Dropped", "26,479", "-2.5%")
-    a4.metric("Cancelled Invoices Purged", "18,390", "-1.7%")
-    
-    st.write("")
-    
-    # Live Pipeline Execution Log
-    st.markdown("#### 📜 Production Pipeline Audit Logs (`data_pipeline.log`)")
-    if os.path.exists("data_pipeline.log"):
-        with open("data_pipeline.log", "r") as f:
-            log_content = f.read()
-        st.code(log_content, language="log")
+
+    # ── Input Mode Selector ─────────────────────────────────────────────────────
+    st.markdown("#### 📂 Step 1 · Choose Data Source")
+
+    input_mode = st.radio(
+        "How do you want to provide the raw CSV?",
+        ["⬆️ Upload a file", "📁 Use a local file from data/raw/"],
+        horizontal=True,
+        key="pipeline_input_mode",
+        help="For large files (>50 MB) already on disk, use the local file option to avoid browser upload limits."
+    )
+
+    # ── Discover local raw files ────────────────────────────────────────────────
+    raw_dir = "data/raw"
+    local_csvs = [f for f in os.listdir(raw_dir) if f.lower().endswith(".csv")] if os.path.isdir(raw_dir) else []
+
+    uploaded_file = None
+    local_file_path = None
+
+    if input_mode == "⬆️ Upload a file":
+        uploaded_file = st.file_uploader(
+            "Upload your retail transactions CSV (e.g. online_retail_II.csv)",
+            type=["csv"],
+            key="pipeline_upload",
+            help="Max 500 MB. For larger files, use the local file option instead."
+        )
     else:
-        st.info("Log file `data_pipeline.log` is currently clean.")
+        if not local_csvs:
+            st.warning("No CSV files found in `data/raw/`. Place your raw CSV there and refresh.")
+        else:
+            chosen = st.selectbox(
+                "Select a raw CSV from data/raw/:",
+                local_csvs,
+                key="pipeline_local_select"
+            )
+            local_file_path = os.path.join(raw_dir, chosen)
+            sz_mb = os.path.getsize(local_file_path) / 1024 / 1024
+            st.info(f"📄 **{chosen}** — {sz_mb:.1f} MB on disk. No upload needed.")
+
+    # ── Determine if we have an active data source ──────────────────────────────
+    has_source = (uploaded_file is not None) or (local_file_path is not None)
+
+    if has_source:
+        # Build a stable key to detect source changes
+        if uploaded_file is not None:
+            file_key = f"upload_{uploaded_file.name}_{uploaded_file.size}"
+        else:
+            file_key = f"local_{local_file_path}_{os.path.getmtime(local_file_path)}"
+
+        if st.session_state.get("_pipeline_file_key") != file_key:
+            for k in ["_pipeline_results", "_pipeline_logs", "_pipeline_metrics",
+                      "_pipeline_rfm", "_pipeline_clean_df", "_pipeline_file_key",
+                      "_pipeline_raw_df", "_pipeline_raw_bytes", "_pipeline_data_ready"]:
+                st.session_state.pop(k, None)
+        st.session_state["_pipeline_file_key"] = file_key
+
+        # ── Bronze Layer Preview ────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("""
+        <div style="background:#1e2235; border:1px solid rgba(245,158,11,0.4); border-radius:12px; padding:16px 20px; margin-bottom:16px;">
+            <span style="font-size:0.78rem; color:#fcd34d; font-weight:700; letter-spacing:1px;">🥉 BRONZE LAYER — RAW INGESTION</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if "_pipeline_raw_df" not in st.session_state:
+            with st.spinner("📥 Reading raw CSV..."):
+                try:
+                    if uploaded_file is not None:
+                        raw_bytes = uploaded_file.read()
+                        try:
+                            raw_df = pd.read_csv(io.BytesIO(raw_bytes), encoding="ISO-8859-1")
+                        except Exception:
+                            raw_df = pd.read_csv(io.BytesIO(raw_bytes))
+                        st.session_state["_pipeline_raw_bytes"] = raw_bytes
+                    else:
+                        # Local file — read directly; store path so pipeline can use it
+                        try:
+                            raw_df = pd.read_csv(local_file_path, encoding="ISO-8859-1")
+                        except Exception:
+                            raw_df = pd.read_csv(local_file_path)
+                        # Store None for bytes — pipeline will use path directly
+                        st.session_state["_pipeline_raw_bytes"] = None
+                        st.session_state["_pipeline_local_path"] = local_file_path
+                    st.session_state["_pipeline_raw_df"] = raw_df
+                except Exception as e:
+                    st.error(f"❌ Failed to read file: {e}")
+                    st.stop()
+
+        raw_df = st.session_state["_pipeline_raw_df"]
+        raw_bytes = st.session_state.get("_pipeline_raw_bytes")
+
+        b1, b2, b3 = st.columns(3)
+        b1.metric("📦 Raw Records Ingested", f"{len(raw_df):,}")
+        b2.metric("📋 Columns Detected", f"{raw_df.shape[1]}")
+        if raw_bytes is not None:
+            b3.metric("💾 File Size", f"{len(raw_bytes)/1024:.1f} KB")
+        else:
+            b3.metric("💾 File Size", f"{os.path.getsize(st.session_state['_pipeline_local_path'])/1024/1024:.1f} MB")
+
+        with st.expander("🔍 Raw Data Preview (first 5 rows)", expanded=False):
+            st.dataframe(raw_df.head(5), use_container_width=True)
+            dtype_df = pd.DataFrame({"Column": raw_df.dtypes.index, "Dtype": raw_df.dtypes.values.astype(str),
+                                     "Nulls": raw_df.isnull().sum().values})
+            st.dataframe(dtype_df, use_container_width=True)
+
+
+        # ── Run Pipeline Button ────────────────────────────────────────────────
+        st.markdown("---")
+        run_col, _ = st.columns([1, 3])
+        run_pipeline = run_col.button("🚀 Run Full Pipeline", type="primary", use_container_width=True,
+                                       disabled="_pipeline_results" in st.session_state)
+
+        if "_pipeline_results" not in st.session_state and not run_pipeline:
+            st.info("⬆️  Upload complete. Click **Run Full Pipeline** to execute all stages.")
+
+        if run_pipeline or "_pipeline_results" in st.session_state:
+
+            # ── Execute pipeline (only if not cached) ─────────────────────────
+            if "_pipeline_results" not in st.session_state:
+
+                # Set up in-memory log capture
+                class _MemLogHandler(_logging.Handler):
+                    def __init__(self):
+                        super().__init__()
+                        self.records = []
+                    def emit(self, record):
+                        self.records.append(self.format(record))
+
+                mem_handler = _MemLogHandler()
+                mem_handler.setFormatter(_logging.Formatter("%(asctime)s — %(levelname)s — %(message)s",
+                                                             datefmt="%H:%M:%S"))
+
+                # Attach handler to the data_prep logger
+                dp_logger = _logging.getLogger("src.data_prep")
+                dp_logger.setLevel(_logging.DEBUG)
+                dp_logger.addHandler(mem_handler)
+
+                metrics = {}
+                stage_rows = {}
+
+                progress_bar = st.progress(0, text="Initialising pipeline…")
+                log_placeholder = st.empty()
+
+                def _refresh_logs():
+                    log_placeholder.code("\n".join(mem_handler.records) or "—", language="log")
+
+                try:
+                    import tempfile, pathlib
+                    _raw_bytes = st.session_state.get("_pipeline_raw_bytes")
+                    _local_path = st.session_state.get("_pipeline_local_path")
+
+                    if _raw_bytes is not None:
+                        # Upload mode — write bytes to a temp file
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+                        tmp.write(_raw_bytes)
+                        tmp.flush()
+                        tmp.close()
+                        tmp_path = tmp.name
+                        _is_temp = True
+                    else:
+                        # Local file mode — use path directly, no copy needed
+                        tmp_path = _local_path
+                        _is_temp = False
+
+                    proc = DataPreprocessor(tmp_path)
+
+                    # Stage 1 — Load
+                    progress_bar.progress(10, text="🥉 Stage 1/5 · Loading data…")
+                    proc.load_data()
+                    stage_rows["bronze"] = len(proc.df)
+                    metrics["raw_rows"] = len(proc.df)
+                    _refresh_logs()
+                    time.sleep(0.3)
+
+                    # Stage 2 — Clean
+                    progress_bar.progress(30, text="🧹 Stage 2/5 · Cleaning data…")
+                    before_clean = len(proc.df)
+                    # Capture individual cleaning metrics by peeking at the df before/after sub-steps
+                    # We'll run clean_data and derive from logs
+                    proc.clean_data()
+                    after_clean = len(proc.df)
+                    metrics["rows_after_clean"] = after_clean
+                    metrics["rows_dropped_clean"] = before_clean - after_clean
+                    stage_rows["silver_clean"] = after_clean
+                    _refresh_logs()
+                    time.sleep(0.3)
+
+                    # Stage 3 — Feature Engineering
+                    progress_bar.progress(55, text="⚙️ Stage 3/5 · Feature engineering…")
+                    proc.feature_engineering()
+                    metrics["new_cols"] = ["TotalAmount", "Year", "Month", "Hour", "DayOfWeek", "DayName", "TimeOfDay"]
+                    _refresh_logs()
+                    time.sleep(0.3)
+
+                    # Stage 4 — Encode & Normalize
+                    progress_bar.progress(75, text="🔢 Stage 4/5 · Encoding & normalizing…")
+                    proc.encode_normalize()
+                    metrics["price_mean"] = float(proc.df["Price_Scaled"].mean())
+                    metrics["total_mean"] = float(proc.df["TotalAmount_Scaled"].mean())
+                    metrics["countries"] = int(proc.df["Country"].nunique())
+                    _refresh_logs()
+                    time.sleep(0.3)
+
+                    # Stage 5 — RFM Aggregation
+                    progress_bar.progress(90, text="🥇 Stage 5/5 · Building RFM mart…")
+                    rfm_result = proc.get_customer_data()
+                    metrics["unique_customers"] = len(rfm_result)
+                    stage_rows["gold"] = len(rfm_result)
+                    _refresh_logs()
+                    time.sleep(0.3)
+
+                    # NOTE: Do NOT write to disk here.
+                    # The processed data is kept in session_state until the user
+                    # explicitly clicks "Apply to Dashboard" below. This ensures
+                    # the previously computed large dataset on disk is never
+                    # silently overwritten just by running the pipeline.
+                    progress_bar.progress(100, text="✅ Pipeline complete!")
+                    st.session_state["_pipeline_data_ready"] = True
+
+                    # Parse per-step drops from log records
+                    missing_cid, duplicates, cancelled, invalid, bad_dates = 0, 0, 0, 0, 0
+                    for rec in mem_handler.records:
+                        if "missing Customer ID" in rec:
+                            try: missing_cid = int(rec.split("Dropped ")[1].split(" ")[0].replace(",",""))
+                            except: pass
+                        if "duplicate rows" in rec.lower():
+                            try: duplicates = int(rec.split("Dropped ")[1].split(" ")[0].replace(",",""))
+                            except: pass
+                        if "cancelled orders" in rec.lower():
+                            try: cancelled = int(rec.split("Removed ")[1].split(" ")[0].replace(",",""))
+                            except: pass
+                        if "invalid Quantity" in rec:
+                            try: invalid = int(rec.split("Removed ")[1].split(" ")[0].replace(",",""))
+                            except: pass
+                        if "unparseable InvoiceDate" in rec:
+                            try: bad_dates = int(rec.split("Dropped ")[1].split(" ")[0].replace(",",""))
+                            except: pass
+                    metrics["missing_cid"] = missing_cid
+                    metrics["duplicates"] = duplicates
+                    metrics["cancelled"] = cancelled
+                    metrics["invalid"] = invalid
+                    metrics["bad_dates"] = bad_dates
+
+                    st.session_state["_pipeline_results"] = proc.df.copy()
+                    st.session_state["_pipeline_rfm"] = rfm_result.copy()
+                    st.session_state["_pipeline_logs"] = list(mem_handler.records)
+                    st.session_state["_pipeline_metrics"] = metrics
+                    st.session_state["_pipeline_stage_rows"] = stage_rows
+
+                    if _is_temp:
+                        pathlib.Path(tmp_path).unlink(missing_ok=True)
+
+                except Exception as e:
+                    progress_bar.empty()
+                    st.error(f"❌ Pipeline failed: {e}")
+                    st.exception(e)
+                    st.stop()
+                finally:
+                    dp_logger.removeHandler(mem_handler)
+
+            # ── Display Results ────────────────────────────────────────────────
+            metrics    = st.session_state["_pipeline_metrics"]
+            logs       = st.session_state["_pipeline_logs"]
+            clean_df   = st.session_state["_pipeline_results"]
+            rfm_result = st.session_state["_pipeline_rfm"]
+            stage_rows = st.session_state.get("_pipeline_stage_rows", {})
+            raw_rows   = metrics.get("raw_rows", len(raw_df))
+
+            # ── Apply to Dashboard button ──────────────────────────────────────
+            if st.session_state.get("_pipeline_data_ready") and not st.session_state.get("_using_pipeline_data"):
+                st.success("✅ Pipeline complete! Review results below, then apply when ready.")
+                st.warning(
+                    "⚠️ Clicking **Apply to Dashboard** will **overwrite** the existing "
+                    "`data/processed/` files with this new dataset. Your previously computed "
+                    "large dataset will be replaced. This action cannot be undone."
+                )
+                if st.button("🔄 Apply to Dashboard (Overwrite & Reload with New Data)",
+                             type="primary", use_container_width=True, key="apply_pipeline_btn"):
+                    # ── Write to disk only NOW (user explicitly confirmed) ──────
+                    import pathlib as _pl
+                    _out = "data/processed"
+                    _pl.Path(_out).mkdir(parents=True, exist_ok=True)
+                    _save_df = st.session_state["_pipeline_results"]
+                    _save_rfm = st.session_state["_pipeline_rfm"]
+                    _save_cols = [c for c in _save_df.columns if not c.endswith("_Scaled")]
+                    # Full cleaned transactions
+                    _save_df[_save_cols].to_csv(f"{_out}/cleaned_transactions.csv", index=False)
+                    # Random sample (≤25K rows) for fast EDA & association rules
+                    _n = min(25_000, len(_save_df))
+                    _save_df[_save_cols].sample(n=_n, random_state=42).to_csv(
+                        f"{_out}/transactions_sample.csv", index=False
+                    )
+                    # RFM mart
+                    _save_rfm.to_csv(f"{_out}/rfm_customer_data.csv", index=False)
+                    # ── Now clear caches and reload ────────────────────────────
+                    load_rfm_mart.clear()
+                    load_transactions_sample.clear()
+                    st.session_state["_using_pipeline_data"] = True
+                    st.session_state.pop("_clf_results", None)
+                    st.session_state.pop("_mba_rules", None)
+                    st.session_state.pop("_mba_key", None)
+                    st.rerun()
+
+            # ── Silver Layer ───────────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("""
+            <div style="background:#1e2235; border:1px solid rgba(59,130,246,0.4); border-radius:12px; padding:16px 20px; margin-bottom:16px;">
+                <span style="font-size:0.78rem; color:#93c5fd; font-weight:700; letter-spacing:1px;">🥈 SILVER LAYER — CLEANSED & ENRICHED TRANSACTIONS</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            silver_rows = metrics.get("rows_after_clean", len(clean_df))
+            retention   = silver_rows / raw_rows * 100 if raw_rows else 0
+
+            s1, s2, s3, s4, s5 = st.columns(5)
+            s1.metric("✅ Rows After Cleaning",    f"{silver_rows:,}",   f"{retention:.1f}% retained")
+            s2.metric("🗑️ Missing Customer IDs",   f"{metrics.get('missing_cid',0):,}",  "Dropped")
+            s3.metric("🔁 Duplicate Rows",         f"{metrics.get('duplicates',0):,}",   "Dropped")
+            s4.metric("❌ Cancelled Invoices",      f"{metrics.get('cancelled',0):,}",   "Removed")
+            s5.metric("📅 Bad Date Rows",           f"{metrics.get('bad_dates',0):,}",   "Coerced → Dropped")
+
+            with st.expander("🔬 New Features Added (Feature Engineering)", expanded=False):
+                new_cols = metrics.get("new_cols", [])
+                st.markdown(f"**{len(new_cols)} new columns created:** " +
+                            ", ".join([f"`{c}`" for c in new_cols]))
+                show_cols = [c for c in new_cols if c in clean_df.columns]
+                if show_cols:
+                    st.dataframe(clean_df[show_cols].head(8), use_container_width=True)
+
+            with st.expander("📊 Encoding & Normalization Stats", expanded=False):
+                ec1, ec2, ec3 = st.columns(3)
+                ec1.metric("🌍 Unique Countries Encoded", metrics.get("countries", "—"))
+                ec2.metric("Price_Scaled µ",  f"{metrics.get('price_mean', 0):.4f}")
+                ec3.metric("TotalAmount_Scaled µ", f"{metrics.get('total_mean', 0):.4f}")
+                if "Price_Scaled" in clean_df.columns:
+                    st.dataframe(clean_df[["Customer ID","Invoice","Price","Price_Scaled",
+                                           "TotalAmount","TotalAmount_Scaled"]].head(8),
+                                 use_container_width=True)
+
+            # ── Gold Layer ─────────────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("""
+            <div style="background:#1e2235; border:1px solid rgba(16,185,129,0.4); border-radius:12px; padding:16px 20px; margin-bottom:16px;">
+                <span style="font-size:0.78rem; color:#6ee7b7; font-weight:700; letter-spacing:1px;">🥇 GOLD LAYER — RFM CUSTOMER ANALYTICS MART</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+            g1, g2, g3 = st.columns(3)
+            g1.metric("👥 Unique Customers",    f"{metrics.get('unique_customers', len(rfm_result)):,}")
+            g2.metric("📅 Avg Recency (days)",  f"{rfm_result['Recency'].mean():.0f}")
+            g3.metric("💰 Avg Monetary (£)",    f"£{rfm_result['Monetary'].mean():.2f}")
+
+            with st.expander("🏆 RFM Table Preview", expanded=True):
+                st.dataframe(rfm_result.head(20).style.background_gradient(cmap="viridis", subset=["Monetary"]),
+                             use_container_width=True)
+
+            # ── Audit Metrics & Waterfall ──────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### 🛡️ Full Audit Metrics")
+            a1, a2, a3, a4, a5 = st.columns(5)
+            a1.metric("Raw Ingested",          f"{raw_rows:,}")
+            a2.metric("Missing CIDs Dropped",  f"{metrics.get('missing_cid',0):,}",
+                      f"-{metrics.get('missing_cid',0)/raw_rows*100:.1f}%" if raw_rows else "")
+            a3.metric("Duplicates Dropped",    f"{metrics.get('duplicates',0):,}",
+                      f"-{metrics.get('duplicates',0)/raw_rows*100:.1f}%" if raw_rows else "")
+            a4.metric("Cancelled Purged",      f"{metrics.get('cancelled',0):,}",
+                      f"-{metrics.get('cancelled',0)/raw_rows*100:.1f}%" if raw_rows else "")
+            a5.metric("Invalid Qty/Price",     f"{metrics.get('invalid',0):,}",
+                      f"-{metrics.get('invalid',0)/raw_rows*100:.1f}%" if raw_rows else "")
+
+            # Waterfall chart
+            dropped_total = (metrics.get("missing_cid",0) + metrics.get("duplicates",0) +
+                             metrics.get("cancelled",0)  + metrics.get("invalid",0))
+            stage_labels = ["Raw Ingested", "After Missing CID Drop", "After Dedup",
+                            "After Cancel Removal", "After Invalid Filter", "Final Clean"]
+            stage_vals   = [
+                raw_rows,
+                raw_rows - metrics.get("missing_cid", 0),
+                raw_rows - metrics.get("missing_cid", 0) - metrics.get("duplicates", 0),
+                raw_rows - metrics.get("missing_cid", 0) - metrics.get("duplicates", 0) - metrics.get("cancelled", 0),
+                silver_rows,
+                silver_rows
+            ]
+            wf_fig = go.Figure(go.Bar(
+                x=stage_labels, y=stage_vals,
+                marker_color=["#f59e0b", "#f87171", "#fb923c", "#facc15", "#34d399", "#6ee7b7"],
+                text=[f"{v:,}" for v in stage_vals],
+                textposition="outside"
+            ))
+            wf_fig.update_layout(
+                template="plotly_dark", height=340,
+                title="Data Volume at Each Pipeline Stage",
+                margin=dict(l=20, r=20, t=40, b=20),
+                yaxis_title="Row Count", xaxis_title=""
+            )
+            st.plotly_chart(wf_fig, use_container_width=True)
+
+            # ── Live Logs ──────────────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### 📜 Real-Time Pipeline Audit Log")
+            log_text = "\n".join(logs) if logs else "No log output captured."
+            st.code(log_text, language="log")
+
+            # Also show file log if it exists
+            if os.path.exists("data_pipeline.log"):
+                with st.expander("📁 Full `data_pipeline.log` (persistent file)", expanded=False):
+                    with open("data_pipeline.log", "r") as _f:
+                        st.code(_f.read(), language="log")
+
+            # ── Downloads ─────────────────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("#### 💾 Download Processed Outputs")
+            dl1, dl2, dl3 = st.columns(3)
+
+            clean_csv_path = "data/processed/cleaned_transactions.csv"
+            rfm_csv_path   = "data/processed/rfm_customer_data.csv"
+
+            if os.path.exists(clean_csv_path):
+                with open(clean_csv_path, "rb") as _f:
+                    dl1.download_button("⬇️ cleaned_transactions.csv", _f, "cleaned_transactions.csv",
+                                        "text/csv", use_container_width=True)
+
+            if os.path.exists(rfm_csv_path):
+                with open(rfm_csv_path, "rb") as _f:
+                    dl2.download_button("⬇️ rfm_customer_data.csv", _f, "rfm_customer_data.csv",
+                                        "text/csv", use_container_width=True)
+
+            dl3.download_button("⬇️ Pipeline Log (.txt)", log_text.encode(),
+                                "pipeline_run.log", "text/plain", use_container_width=True)
+
+    else:
+        # No file uploaded yet — show architecture diagram as guidance
+        st.markdown("#### 🏗️ Medallion Pipeline Architecture")
+        st.markdown("""
+        <div style="display:flex; justify-content:space-between; gap:15px; margin-bottom:20px; flex-wrap:wrap;">
+            <div style="flex:1; min-width:220px; background:#1e2235; border:1px solid rgba(245,158,11,0.3); border-radius:12px; padding:18px; text-align:center;">
+                <div style="font-size:2rem;">🥉</div>
+                <div style="font-size:0.8rem; color:#fcd34d; font-weight:700; margin-top:8px;">BRONZE LAYER</div>
+                <p style="font-size:0.82rem; color:#94a3b8; margin:6px 0 0;">Raw CSV ingestion. Missing IDs, cancellations, encoding issues.</p>
+            </div>
+            <div style="flex:0.2; display:flex; align-items:center; justify-content:center; font-size:1.5rem; color:#475569;">→</div>
+            <div style="flex:1; min-width:220px; background:#1e2235; border:1px solid rgba(59,130,246,0.3); border-radius:12px; padding:18px; text-align:center;">
+                <div style="font-size:2rem;">🥈</div>
+                <div style="font-size:0.8rem; color:#93c5fd; font-weight:700; margin-top:8px;">SILVER LAYER</div>
+                <p style="font-size:0.82rem; color:#94a3b8; margin:6px 0 0;">Cleaned, de-duped, enriched with TotalAmount, TimeOfDay, DayOfWeek features.</p>
+            </div>
+            <div style="flex:0.2; display:flex; align-items:center; justify-content:center; font-size:1.5rem; color:#475569;">→</div>
+            <div style="flex:1; min-width:220px; background:#1e2235; border:1px solid rgba(16,185,129,0.3); border-radius:12px; padding:18px; text-align:center;">
+                <div style="font-size:2rem;">🥇</div>
+                <div style="font-size:0.8rem; color:#6ee7b7; font-weight:700; margin-top:8px;">GOLD LAYER</div>
+                <p style="font-size:0.82rem; color:#94a3b8; margin:6px 0 0;">RFM customer analytics mart — ready for ML inference.</p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.info("⬆️  Upload a raw transactions CSV above to execute the live pipeline.")
 
 # ==========================================
 # FOOTER
